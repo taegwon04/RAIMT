@@ -1,358 +1,461 @@
+"""
+RAILT: Recurrent Memory AttentIon for Large-Scale Interaction Knowledge Tracing
+
+Paper-aligned implementation.
+Each module is annotated with the corresponding equation numbers
+from the paper for clarity.
+
+Architecture Overview:
+    Encoder: Problem ID + Skill → RMA Block → Gated Memory Update
+    Decoder: Response → RMA Block → Cross-Attention → Gated Memory Update
+    Output:  LayerNorm → Linear → Sigmoid
+"""
+
 import torch
 import torch.nn as nn
 
+# ---------------------------------------------------------------------------
+# Recurrent Memory Attention Block  (Section 3.1, Eq. 2–4)
+# ---------------------------------------------------------------------------
+class RMABlock(nn.Module):
+    """
+    Recurrent Memory Attention Block.
 
-class RMA_Block(nn.Module):
+    At each chunk step k:
+        z^(k) = [mem^(k-1) ; chunk^(k)] + P            ... Eq. (2)
+        ẑ     = z^(k) + MHA(LN(z^(k)))                  ... Eq. (3)
+        RMA(z^(k)) = ẑ + FFN(LN(ẑ))                     ... Eq. (3)
+        [mem_cand^(k) ; h^(k)] = RMA(z^(k))             ... Eq. (4)
+
+    Memory tokens have global attention access; chunk tokens are
+    restricted by a causal mask to prevent attending to future positions.
     """
-    RMA (Recurrent Memory Attention) Module
-    
-    [Memory | Current Chunk] → Pos Emb → Multi-Head Local Self-Attention → FFN → Split
-    
-    Returns:
-        data_out: output tokens for current chunk
-        mem_new: new memory candidate (before gating)
-    """
-    def __init__(self, dim_model, num_heads, dropout, chunk_len, mem_len):
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float,
+                 chunk_len: int, mem_len: int):
         super().__init__()
-        self.dim_model = dim_model
+        self.d_model = d_model
         self.chunk_len = chunk_len
         self.mem_len = mem_len
 
-        self.pos_emb = nn.Embedding(mem_len + chunk_len, dim_model)
+        # Learnable positional embedding P  (Eq. 2)
+        self.pos_emb = nn.Embedding(mem_len + chunk_len, d_model)
 
+        # Multi-Head Self-Attention  (Eq. 3)
         self.self_attn = nn.MultiheadAttention(
-            dim_model, num_heads, dropout=dropout, batch_first=True
+            d_model, n_heads, dropout=dropout, batch_first=True
         )
+
+        # Position-wise Feed-Forward Network  (Eq. 3)
         self.ffn = nn.Sequential(
-            nn.Linear(dim_model, dim_model * 4),
+            nn.Linear(d_model, d_model * 4),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(dim_model * 4, dim_model),
+            nn.Linear(d_model * 4, d_model),
         )
-        self.ln_attn = nn.LayerNorm(dim_model)
-        self.ln_ffn = nn.LayerNorm(dim_model)
+
+        # Pre-Layer Normalization
+        self.ln_attn = nn.LayerNorm(d_model)
+        self.ln_ffn = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, chunk_data, mem_state, device, return_attn=False):
-        B, Lc, D = chunk_data.shape
+    def forward(self, chunk, mem, return_attn=False):
+        """
+        Args:
+            chunk: (B, L_c, D)  — current chunk tokens
+            mem:   (B, M, D)    — previous memory state
+        Returns:
+            h_k:          (B, L_c, D) — chunk representation
+            mem_candidate: (B, M, D)  — new memory candidate (before gating)
+            attn_weights:  (optional)  — attention weights for visualization
+        """
+        device = chunk.device
+        L_c = chunk.size(1)
 
-        # === Concatenate: [Memory | Current Chunk] ===
-        combined = torch.cat([mem_state, chunk_data], dim=1)
+        # --- Eq. (2): z^(k) = [mem^(k-1) ; chunk^(k)] + P ---
+        z = torch.cat([mem, chunk], dim=1)
+        pos_ids = torch.arange(z.size(1), device=device).unsqueeze(0)
+        z = z + self.pos_emb(pos_ids)
 
-        # === Position Embedding ===
-        pos_ids = torch.arange(combined.size(1), device=device).unsqueeze(0)
-        combined = combined + self.pos_emb(pos_ids)
-
-        # === Causal Mask (data tokens only; memory can attend freely) ===
-        total_len = combined.size(1)
-        causal_mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=device)
+        # --- Causal mask: memory has global access; chunk is causal ---
+        total_len = z.size(1)
+        causal_mask = torch.zeros(
+            total_len, total_len, dtype=torch.bool, device=device
+        )
         causal_mask[self.mem_len:, self.mem_len:] = torch.triu(
-            torch.ones(Lc, Lc, dtype=torch.bool, device=device), diagonal=1
+            torch.ones(L_c, L_c, dtype=torch.bool, device=device), diagonal=1
         )
 
-        # === Multi-Head Local Self-Attention ===
-        normed = self.ln_attn(combined)
+        # --- Eq. (3): ẑ = z^(k) + MHA(LN(z^(k))) ---
+        z_norm = self.ln_attn(z)
         attn_out, attn_weights = self.self_attn(
-            normed, normed, normed,
+            z_norm, z_norm, z_norm,
             attn_mask=causal_mask,
             need_weights=return_attn,
-            average_attn_weights=False
+            average_attn_weights=False,
         )
-        combined = combined + self.dropout(attn_out)
+        z = z + self.dropout(attn_out)
 
-        # === Position-wise FFN Block ===
-        normed = self.ln_ffn(combined)
-        combined = combined + self.dropout(self.ffn(normed))
+        # --- Eq. (3): RMA(z^(k)) = ẑ + FFN(LN(ẑ)) ---
+        z = z + self.dropout(self.ffn(self.ln_ffn(z)))
 
-        # === Split: New Memory / Output Tokens ===
-        mem_new = combined[:, :self.mem_len, :]
-        data_out = combined[:, self.mem_len:, :]
+        # --- Eq. (4): split → [mem_candidate^(k) ; h^(k)] ---
+        mem_candidate = z[:, :self.mem_len, :]
+        h_k = z[:, self.mem_len:, :]
 
         if return_attn:
-            return data_out, mem_new, attn_weights
-        return data_out, mem_new
+            return h_k, mem_candidate, attn_weights
+        return h_k, mem_candidate
 
 
-class RAIMT_Encoder(nn.Module):
+# ---------------------------------------------------------------------------
+# Gated Memory Update  (Section 3.1, Eq. 5)
+# ---------------------------------------------------------------------------
+class GatedMemoryUpdate(nn.Module):
     """
-    Encoder: ProblemID + Skill → RMA → Gated Memory Update
+    Gated memory update mechanism.
+
+        G^(k) = σ(W_g · mem_cand^(k))                   ... Eq. (5)
+        mem^(k) = G^(k) ⊙ mem_cand^(k)
+                  + (1 - G^(k)) ⊙ mem^(k-1)             ... Eq. (5)
     """
-    def __init__(self, dim_model, num_heads, total_ex, total_cat, seq_len,
-                 dropout, chunk_len=50, mem_len=16):
+
+    def __init__(self, d_model: int):
         super().__init__()
-        self.dim_model = dim_model
+        self.gate_proj = nn.Linear(d_model, d_model)     # W_g
+
+    def forward(self, mem_candidate, mem_prev):
+        gate = torch.sigmoid(self.gate_proj(mem_candidate))  # G^(k)
+        return gate * mem_candidate + (1 - gate) * mem_prev  # mem^(k)
+
+
+# ---------------------------------------------------------------------------
+# RAILT Encoder  (Section 3.2, Eq. 6)
+# ---------------------------------------------------------------------------
+class RAILTEncoder(nn.Module):
+    """
+    Encoder: embeds problem & skill IDs, then processes chunks
+    through an RMA block with gated memory propagation.
+
+        x_t = Emb_prob(q_t) + Emb_skill(s_t)            ... Eq. (6)
+
+    Outputs per-timestep representations h and the final memory
+    mem^(K), which serves as a compressed summary of the input.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, total_ex: int,
+                 total_cat: int, dropout: float,
+                 chunk_len: int = 50, mem_len: int = 16):
+        super().__init__()
+        self.d_model = d_model
         self.chunk_len = chunk_len
         self.mem_len = mem_len
 
-        # === Input Embeddings ===
-        self.embd_problem = nn.Embedding(total_ex, dim_model, padding_idx=0)
-        self.embd_skill = nn.Embedding(total_cat, dim_model, padding_idx=0)
+        # --- Eq. (6): input embeddings ---
+        self.emb_problem = nn.Embedding(total_ex, d_model, padding_idx=0)
+        self.emb_skill = nn.Embedding(total_cat, d_model, padding_idx=0)
 
-        # === Initial Memory Tokens ===
-        self.mem_tokens = nn.Parameter(torch.zeros(1, mem_len, dim_model))
-        nn.init.xavier_uniform_(self.mem_tokens)
+        # Learnable initial memory mem^(0)
+        self.mem_init = nn.Parameter(torch.zeros(1, mem_len, d_model))
+        nn.init.xavier_uniform_(self.mem_init)
 
-        # === RMA Block ===
-        self.rma = RMA_Block(dim_model, num_heads, dropout, chunk_len, mem_len)
-
-        # === Gated Memory Update: g(·) ===
-        self.gate_proj = nn.Linear(dim_model, dim_model)
-
-    def _gated_memory_update(self, mem_new, mem_old):
-        """
-        g(·): Gated Memory Update
-        next_mem = gate * mem_new + (1 - gate) * mem_old
-        """
-        gate = torch.sigmoid(self.gate_proj(mem_new))
-        return gate * mem_new + (1 - gate) * mem_old
+        # RMA block & gated update
+        self.rma = RMABlock(d_model, n_heads, dropout, chunk_len, mem_len)
+        self.gate = GatedMemoryUpdate(d_model)
 
     def forward(self, in_ex, in_cat, first_block=True, return_attn=False):
-        device = in_ex.device
-
+        """
+        Args:
+            in_ex:  problem IDs (B, L) or hidden states (B, L, D)
+            in_cat: skill IDs   (B, L) — ignored when first_block=False
+        """
         if first_block:
-            out = self.embd_problem(in_ex) + self.embd_skill(in_cat)
+            # --- Eq. (6) ---
+            x = self.emb_problem(in_ex) + self.emb_skill(in_cat)
             B, L = in_ex.shape
         else:
-            out = in_ex
-            B, L, _ = out.shape
+            x = in_ex
+            B, L, _ = x.shape
 
-        outputs, attn_maps = [], []
-        mem_state = self.mem_tokens.expand(out.size(0), -1, -1)
+        mem = self.mem_init.expand(B, -1, -1)
+        chunks_out, attn_maps = [], []
 
         for start in range(0, L, self.chunk_len):
-            end = min(start + self.chunk_len, L)
-            chunk = out[:, start:end, :]
+            chunk = x[:, start:min(start + self.chunk_len, L), :]
             if chunk.size(1) == 0:
                 continue
 
-            # === RMA Block ===
+            # --- RMA block (Eq. 2–4) ---
             if return_attn:
-                data_out, mem_new, weights = self.rma(chunk, mem_state, device, return_attn=True)
+                h_k, mem_candidate, weights = self.rma(
+                    chunk, mem, return_attn=True
+                )
                 attn_maps.append(weights.detach().cpu())
             else:
-                data_out, mem_new = self.rma(chunk, mem_state, device)
+                h_k, mem_candidate = self.rma(chunk, mem)
 
-            # === Gated Memory Update ===
-            if start > 0:  # first chunk: no previous memory to gate with
-                mem_state = self._gated_memory_update(mem_new, mem_state)
-            else:
-                mem_state = mem_new
+            # --- Gated memory update (Eq. 5) ---
+            # Applied immediately after RMA in encoder (Section 3.1)
+            mem = self.gate(mem_candidate, mem) if start > 0 else mem_candidate
+            chunks_out.append(h_k)
 
-            outputs.append(data_out)
-
-        final_out = torch.cat(outputs, dim=1) if outputs else out
+        enc_out = torch.cat(chunks_out, dim=1) if chunks_out else x
 
         if return_attn:
-            return final_out, mem_state, attn_maps
-        return final_out, mem_state
+            return enc_out, mem, attn_maps
+        return enc_out, mem
 
 
-class RAIMT_Decoder(nn.Module):
+# ---------------------------------------------------------------------------
+# RAILT Decoder  (Section 3.3, Eq. 7–9)
+# ---------------------------------------------------------------------------
+class RAILTDecoder(nn.Module):
     """
-    Decoder: Response → RMA → Cross-Attention → FFN → Gated Memory Update
+    Decoder: embeds response sequence, applies RMA self-attention,
+    then cross-attends to encoder outputs before gated memory update.
+
+    Cross-attention key/value construction:
+        kv^(k) = [W_m · mem_enc ; h^(k)_enc]            ... Eq. (7)
+
+    Cross-attention:
+        h^(k)_cross = MHA(h^(k), kv^(k), kv^(k))       ... Eq. (8)
+
+    Note: Decoder memory is excluded from the cross-attention query
+    to prevent information leakage (Section 3.3).
+
+    Memory update is applied *after* cross-attention (Section 3.1).
     """
-    def __init__(self, dim_model, total_res, num_heads, seq_len, dropout,
-                 chunk_len=50, mem_len=16):
+
+    def __init__(self, d_model: int, total_res: int, n_heads: int,
+                 dropout: float, chunk_len: int = 50, mem_len: int = 16):
         super().__init__()
-        self.dim_model = dim_model
+        self.d_model = d_model
         self.chunk_len = chunk_len
         self.mem_len = mem_len
 
-        # === Input Embedding ===
-        self.embd_response = nn.Embedding(total_res, dim_model, padding_idx=0)
+        # Response embedding
+        self.emb_response = nn.Embedding(total_res, d_model, padding_idx=0)
 
-        # === Initial Memory Tokens ===
-        self.mem_tokens = nn.Parameter(torch.zeros(1, mem_len, dim_model))
-        nn.init.xavier_uniform_(self.mem_tokens)
+        # Learnable initial decoder memory
+        self.mem_init = nn.Parameter(torch.zeros(1, mem_len, d_model))
+        nn.init.xavier_uniform_(self.mem_init)
 
-        # === Memory Projection (encoder mem → decoder initial mem) ===
-        self.mem_proj = nn.Linear(dim_model, dim_model)
+        # Projection: encoder memory → decoder initial memory
+        self.mem_proj = nn.Linear(d_model, d_model)
 
-        # === RMA Block (Self-Attention part) ===
-        self.rma = RMA_Block(dim_model, num_heads, dropout, chunk_len, mem_len)
+        # RMA block (self-attention part)
+        self.rma = RMABlock(d_model, n_heads, dropout, chunk_len, mem_len)
 
-        # === Recurrent Memory Cross-Attention ===
-        self.enc_mem_proj = nn.Linear(dim_model, dim_model)
+        # --- Eq. (7): encoder memory projection W_m ---
+        self.enc_mem_proj = nn.Linear(d_model, d_model)
+
+        # --- Eq. (8): cross-attention ---
         self.cross_attn = nn.MultiheadAttention(
-            dim_model, num_heads, dropout=dropout, batch_first=True
+            d_model, n_heads, dropout=dropout, batch_first=True
         )
-        self.ln_cross_q = nn.LayerNorm(dim_model)
-        self.ln_cross_kv = nn.LayerNorm(dim_model)
-
-        # === Post Cross-Attention FFN ===
-        self.ffn = nn.Sequential(
-            nn.Linear(dim_model, dim_model * 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_model * 4, dim_model),
-        )
-        self.ln_ffn = nn.LayerNorm(dim_model)
-
-        # === Gated Memory Update: g(·) ===
-        self.gate_proj = nn.Linear(dim_model, dim_model)
-
-        self.dropout = nn.Dropout(dropout)
-
-    def _gated_memory_update(self, mem_new, mem_old):
-        """g(·): Gated Memory Update"""
-        gate = torch.sigmoid(self.gate_proj(mem_new))
-        return gate * mem_new + (1 - gate) * mem_old
-
-    def _cross_attention(self, data_out, enc_chunk, enc_mem, device,
-                         return_attn=False):
-        """
-        Recurrent Memory Cross-Attention
-        Query: decoder data output
-        Key/Value: [projected encoder memory | encoder chunk output]
-        """
-        Lc = data_out.size(1)
-        query = self.ln_cross_q(data_out)
-
-        if enc_mem is not None:
-            proj_mem = self.enc_mem_proj(enc_mem)
-            cross_kv = torch.cat([proj_mem, enc_chunk], dim=1)
-            cross_kv = self.ln_cross_kv(cross_kv)
-
-            M = proj_mem.size(1)
-            cross_mask = torch.zeros(Lc, M + Lc, dtype=torch.bool, device=device)
-            cross_mask[:, M:] = torch.triu(
-                torch.ones(Lc, Lc, dtype=torch.bool, device=device), diagonal=1
-            )
-        else:
-            cross_kv = self.ln_cross_kv(enc_chunk)
-            cross_mask = torch.triu(
-                torch.ones(Lc, Lc, dtype=torch.bool, device=device), diagonal=1
-            )
-
-        cross_out, cross_weights = self.cross_attn(
-            query, cross_kv, cross_kv,
-            attn_mask=cross_mask,
-            need_weights=return_attn,
-            average_attn_weights=False
-        )
-        data_out = data_out + self.dropout(cross_out)
+        self.ln_cross_q = nn.LayerNorm(d_model)
+        self.ln_cross_kv = nn.LayerNorm(d_model)
 
         # Post cross-attention FFN
-        normed = self.ln_ffn(data_out)
-        data_out = data_out + self.dropout(self.ffn(normed))
+        self.ffn_cross = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+        )
+        self.ln_ffn_cross = nn.LayerNorm(d_model)
+
+        # Gated memory update
+        self.gate = GatedMemoryUpdate(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def _cross_attention(self, h_k, enc_chunk, enc_mem, return_attn=False):
+        """
+        Recurrent Memory Cross-Attention (Eq. 7–8).
+
+        Query:     h^(k) (decoder chunk representation only)
+        Key/Value: [W_m · mem_enc ; h^(k)_enc]
+        """
+        device = h_k.device
+        L_c = h_k.size(1)
+        query = self.ln_cross_q(h_k)
+
+        if enc_mem is not None:
+            # --- Eq. (7): kv^(k) = [W_m · mem_enc ; h^(k)_enc] ---
+            proj_mem = self.enc_mem_proj(enc_mem)
+            kv = torch.cat([proj_mem, enc_chunk], dim=1)
+            kv = self.ln_cross_kv(kv)
+
+            M = proj_mem.size(1)
+            cross_mask = torch.zeros(
+                L_c, M + L_c, dtype=torch.bool, device=device
+            )
+            cross_mask[:, M:] = torch.triu(
+                torch.ones(L_c, L_c, dtype=torch.bool, device=device),
+                diagonal=1,
+            )
+        else:
+            kv = self.ln_cross_kv(enc_chunk)
+            cross_mask = torch.triu(
+                torch.ones(L_c, L_c, dtype=torch.bool, device=device),
+                diagonal=1,
+            )
+
+        # --- Eq. (8): h^(k)_cross = MHA(h^(k), kv, kv) ---
+        cross_out, cross_weights = self.cross_attn(
+            query, kv, kv,
+            attn_mask=cross_mask,
+            need_weights=return_attn,
+            average_attn_weights=False,
+        )
+        h_k = h_k + self.dropout(cross_out)
+
+        # Post cross-attention FFN
+        h_k = h_k + self.dropout(self.ffn_cross(self.ln_ffn_cross(h_k)))
 
         if return_attn:
-            return data_out, cross_weights
-        return data_out
+            return h_k, cross_weights
+        return h_k
 
-    def forward(self, in_res, enc_out, enc_mem, first_block=True, return_attn=False):
-        device = enc_out.device
-
+    def forward(self, in_res, enc_out, enc_mem,
+                first_block=True, return_attn=False):
+        """
+        Args:
+            in_res:  response IDs (B, L) or hidden states (B, L, D)
+            enc_out: encoder per-timestep output (B, L, D)
+            enc_mem: encoder final memory (B, M, D)
+        """
         if first_block:
-            out = self.embd_response(in_res)
+            x = self.emb_response(in_res)
             B, L = in_res.shape
         else:
-            out = in_res
-            B, L, _ = out.shape
+            x = in_res
+            B, L, _ = x.shape
 
-        # === Initial Memory: project from encoder memory ===
-        if enc_mem is not None:
-            mem_state = self.mem_proj(enc_mem)
-        else:
-            mem_state = self.mem_tokens.expand(out.size(0), -1, -1)
+        # Initialize decoder memory from encoder memory
+        mem = (self.mem_proj(enc_mem) if enc_mem is not None
+               else self.mem_init.expand(B, -1, -1))
 
-        outputs, self_attn_maps, cross_attn_maps = [], [], []
+        chunks_out = []
+        self_attn_maps, cross_attn_maps = [], []
 
         for start in range(0, L, self.chunk_len):
             end = min(start + self.chunk_len, L)
-            chunk = out[:, start:end, :]
+            chunk = x[:, start:end, :]
             enc_chunk = enc_out[:, start:end, :]
             if chunk.size(1) == 0:
                 continue
 
-            # === RMA Block (Self-Attention) ===
+            # --- RMA self-attention (Eq. 2–4) ---
             if return_attn:
-                data_out, mem_new, self_w = self.rma(chunk, mem_state, device, return_attn=True)
+                h_k, mem_candidate, self_w = self.rma(
+                    chunk, mem, return_attn=True
+                )
                 self_attn_maps.append(self_w.detach().cpu())
             else:
-                data_out, mem_new = self.rma(chunk, mem_state, device)
+                h_k, mem_candidate = self.rma(chunk, mem)
 
-            # === Recurrent Memory Cross-Attention ===
+            # --- Cross-attention (Eq. 7–8) ---
             if return_attn:
-                data_out, cross_w = self._cross_attention(
-                    data_out, enc_chunk, enc_mem, device, return_attn=True
+                h_k, cross_w = self._cross_attention(
+                    h_k, enc_chunk, enc_mem, return_attn=True
                 )
                 cross_attn_maps.append(cross_w.detach().cpu())
             else:
-                data_out = self._cross_attention(
-                    data_out, enc_chunk, enc_mem, device
-                )
+                h_k = self._cross_attention(h_k, enc_chunk, enc_mem)
 
-            # === Gated Memory Update ===
-            if start > 0:
-                mem_state = self._gated_memory_update(mem_new, mem_state)
-            else:
-                mem_state = mem_new
+            # --- Gated memory update *after* cross-attention (Section 3.1) ---
+            mem = (self.gate(mem_candidate, mem) if start > 0
+                   else mem_candidate)
+            chunks_out.append(h_k)
 
-            outputs.append(data_out)
-
-        final_out = torch.cat(outputs, dim=1) if outputs else out
+        dec_out = torch.cat(chunks_out, dim=1) if chunks_out else x
 
         if return_attn:
-            return final_out, self_attn_maps, cross_attn_maps
-        return final_out
+            return dec_out, self_attn_maps, cross_attn_maps
+        return dec_out
 
 
-class RAIMT(nn.Module):
-    def __init__(self, dim_model, num_en, num_de, heads_en, heads_de,
-                 total_ex, total_cat, total_res, seq_len, dropout,
-                 chunk_len=50, mem_len=16):
+# ---------------------------------------------------------------------------
+# RAILT  (Full Model — Section 3, Eq. 9)
+# ---------------------------------------------------------------------------
+class RAILT(nn.Module):
+    """
+    RAILT: Recurrent Memory AttentIon for Large-Scale Interaction
+           Knowledge Tracing.
+
+    Prediction:
+        ŷ_t = σ(W_o · LN(h_t) + b_o)                   ... Eq. (9)
+    """
+
+    def __init__(self, d_model: int, num_enc_layers: int, num_dec_layers: int,
+                 n_heads_enc: int, n_heads_dec: int,
+                 total_ex: int, total_cat: int, total_res: int,
+                 dropout: float, chunk_len: int = 50, mem_len: int = 16):
         super().__init__()
+
         self.encoders = nn.ModuleList([
-            RAIMT_Encoder(dim_model, heads_en, total_ex, total_cat, seq_len,
-                        dropout, chunk_len, mem_len)
-            for _ in range(num_en)
+            RAILTEncoder(d_model, n_heads_enc, total_ex, total_cat,
+                         dropout, chunk_len, mem_len)
+            for _ in range(num_enc_layers)
         ])
         self.decoders = nn.ModuleList([
-            RAIMT_Decoder(dim_model, total_res, heads_de, seq_len,
-                        dropout, chunk_len, mem_len)
-            for _ in range(num_de)
+            RAILTDecoder(d_model, total_res, n_heads_dec,
+                         dropout, chunk_len, mem_len)
+            for _ in range(num_dec_layers)
         ])
-        self.final_ln = nn.LayerNorm(dim_model)
-        self.out = nn.Linear(dim_model, 1)
+
+        # --- Eq. (9): output projection ---
+        self.final_ln = nn.LayerNorm(d_model)
+        self.out_proj = nn.Linear(d_model, 1)
 
     def forward(self, in_ex, in_cat, in_res, return_attn=False):
-        # === Encoder ===
+        """
+        Args:
+            in_ex:  problem IDs  (B, L)
+            in_cat: skill IDs    (B, L)
+            in_res: response IDs (B, L)
+        Returns:
+            pred: (B, L) — predicted probability of correct response
+        """
+        # === Encoder (Section 3.2) ===
         enc_out, enc_mem = None, None
         enc_attns = []
 
         for i, encoder in enumerate(self.encoders):
-            if i == 0 and return_attn:
+            first = (i == 0)
+            if first and return_attn:
                 enc_out, enc_mem, enc_attns = encoder(
                     in_ex, in_cat, first_block=True, return_attn=True
                 )
             else:
                 enc_out, enc_mem = encoder(
-                    enc_out if i > 0 else in_ex,
-                    None if i > 0 else in_cat,
-                    first_block=(i == 0)
+                    enc_out if not first else in_ex,
+                    None if not first else in_cat,
+                    first_block=first,
                 )
 
-        # === Decoder ===
+        # === Decoder (Section 3.3) ===
         dec_out = None
         dec_self_attns, dec_cross_attns = [], []
 
         for i, decoder in enumerate(self.decoders):
-            if i == 0 and return_attn:
+            first = (i == 0)
+            if first and return_attn:
                 dec_out, dec_self_attns, dec_cross_attns = decoder(
                     in_res, enc_out, enc_mem,
-                    first_block=True, return_attn=True
+                    first_block=True, return_attn=True,
                 )
             else:
                 dec_out = decoder(
-                    dec_out if i > 0 else in_res,
+                    dec_out if not first else in_res,
                     enc_out,
-                    enc_mem if i == 0 else None,
-                    first_block=(i == 0)
+                    enc_mem if first else None,
+                    first_block=first,
                 )
 
-        # === Output: LN → Linear → Sigmoid ===
-        pred = torch.sigmoid(self.out(self.final_ln(dec_out))).squeeze(-1)
+        # === Eq. (9): ŷ_t = σ(W_o · LN(h_t) + b_o) ===
+        pred = torch.sigmoid(self.out_proj(self.final_ln(dec_out))).squeeze(-1)
 
         if return_attn:
             return pred, enc_attns, dec_self_attns, dec_cross_attns
